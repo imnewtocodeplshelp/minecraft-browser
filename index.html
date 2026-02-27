@@ -112,9 +112,11 @@ function wsConnect() {
 
   ws.addEventListener('open', () => {
     wsReady = true;
-    // announce ourselves
     wsSend({ type: 'join', id: MY_ID, name: MY_NAME, color: MY_COLOR,
-             x: 0, y: 5, z: 0, yaw: 0 });
+             x: player ? player.pos.x : 0,
+             y: player ? player.pos.y : 5,
+             z: player ? player.pos.z : 0,
+             yaw: yaw || 0 });
   });
 
   ws.addEventListener('message', (e) => {
@@ -178,8 +180,7 @@ function startGame() {
   nameScreen.style.display = 'none';
   gameContainer.style.display = '';
   document.getElementById('playerlist').style.display = '';
-  wsConnect();   // open WS connection first
-  init();
+  init(); // scene must exist before WS messages arrive
 }
 nameBtn.addEventListener('click', startGame);
 nameInput.addEventListener('keydown', e => { if(e.key==='Enter') startGame(); });
@@ -252,6 +253,7 @@ function init() {
   /* tell server we're leaving */
   window.addEventListener('beforeunload', () => { if(ws) ws.close(); });
 
+  wsConnect(); // connect AFTER scene, blocks, and controls are all ready
   tick();
 }
 
