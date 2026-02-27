@@ -453,9 +453,8 @@ function makeNameLabel(name, color) {
   const canvas = document.createElement('canvas');
   canvas.width = 256; canvas.height = 64;
   const ctx = canvas.getContext('2d');
-  ctx.fillStyle = 'rgba(0,0,0,0.55)';
-  ctx.roundRect(4, 4, 248, 56, 8);
-  ctx.fill();
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(4, 4, 248, 56);
   ctx.fillStyle = color;
   ctx.font = 'bold 28px monospace';
   ctx.textAlign = 'center';
@@ -524,7 +523,8 @@ async function sendPlayerPosition() {
 /* Fetch other players from server */
 async function fetchOtherPlayers() {
   const data = await apiGet('get_players', `&myid=${encodeURIComponent(MY_ID)}`);
-  if (!data || !Array.isArray(data.players)) return;
+  if (!data) { console.warn('fetchOtherPlayers: no response'); return; }
+  if (!Array.isArray(data.players)) { console.warn('fetchOtherPlayers: unexpected response', data); return; }
 
   const activeIds = new Set();
   for (const p of data.players) {
@@ -533,8 +533,7 @@ async function fetchOtherPlayers() {
   }
   removeStaleRemotePlayers(activeIds);
 
-  // update player list HUD
-  const count = data.players.length + 1; // +1 for self
+  const count = data.players.length + 1;
   document.getElementById('online-count').textContent = count;
   updatePlayerListHUD(data.players);
 }
@@ -578,6 +577,14 @@ function setupControls(){
     pitch-=e.movementY*0.002;
     pitch=Math.max(-Math.PI/2,Math.min(Math.PI/2,pitch));
   });
+
+  /* left click = break, right click = place (desktop) */
+  document.addEventListener('mousedown',(e)=>{
+    if(document.pointerLockElement!==document.body) return;
+    if(e.button===0) doBreak();
+    if(e.button===2) doPlace();
+  });
+  document.addEventListener('contextmenu',(e)=>e.preventDefault());
 
   /* joysticks */
   const joyBase=document.getElementById('joystick-base');
