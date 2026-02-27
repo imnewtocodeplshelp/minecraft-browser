@@ -83,7 +83,6 @@
    MiniCraft — Multiplayer Edition
    ============================================= */
 
-const SERVER_PHP    = '/api';
 const WORLD_SEED    = 123456;
 const CHUNK_SIZE    = 16;
 const VISIBLE_RADIUS = 1;
@@ -97,11 +96,70 @@ if (!MY_ID) {
   MY_ID = 'p_' + Math.random().toString(36).slice(2,10);
   sessionStorage.setItem('mc_id', MY_ID);
 }
-// assign a random player color once
 const PLAYER_COLORS = ['#ff6b6b','#ffd93b','#6bcb77','#4fc3f7','#ce93d8','#ff8a65','#80cbc4','#f48fb1','#aed581','#fff176'];
 if (!MY_COLOR) {
   MY_COLOR = PLAYER_COLORS[Math.floor(Math.random()*PLAYER_COLORS.length)];
   sessionStorage.setItem('mc_color', MY_COLOR);
+}
+
+/* ── WebSocket ────────────────────────────────────────── */
+let ws = null;
+let wsReady = false;
+
+function wsConnect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}`);
+
+  ws.addEventListener('open', () => {
+    wsReady = true;
+    // announce ourselves
+    wsSend({ type: 'join', id: MY_ID, name: MY_NAME, color: MY_COLOR,
+             x: 0, y: 5, z: 0, yaw: 0 });
+  });
+
+  ws.addEventListener('message', (e) => {
+    let msg; try { msg = JSON.parse(e.data); } catch { return; }
+    handleServerMsg(msg);
+  });
+
+  ws.addEventListener('close', () => {
+    wsReady = false;
+    // reconnect after 2s
+    setTimeout(wsConnect, 2000);
+  });
+
+  ws.addEventListener('error', () => ws.close());
+}
+
+function wsSend(data) {
+  if (ws && ws.readyState === WebSocket.OPEN)
+    ws.send(JSON.stringify(data));
+}
+
+function handleServerMsg(msg) {
+  switch(msg.type) {
+    case 'players_list':
+      for (const p of msg.players) upsertRemotePlayer(p);
+      updatePlayerListHUD();
+      break;
+    case 'player_join':
+      upsertRemotePlayer(msg.player);
+      updatePlayerListHUD();
+      break;
+    case 'player_move':
+      moveRemotePlayer(msg);
+      break;
+    case 'player_leave':
+      removeRemotePlayer(msg.id);
+      updatePlayerListHUD();
+      break;
+    case 'set_block':
+      addBlock(msg.x, msg.y, msg.z, msg.id);
+      break;
+    case 'block_remove':
+      removeBlockAt(msg.x, msg.y, msg.z);
+      break;
+  }
 }
 
 /* ── Name screen ──────────────────────────────────────── */
@@ -120,38 +178,11 @@ function startGame() {
   nameScreen.style.display = 'none';
   gameContainer.style.display = '';
   document.getElementById('playerlist').style.display = '';
+  wsConnect();   // open WS connection first
   init();
 }
 nameBtn.addEventListener('click', startGame);
 nameInput.addEventListener('keydown', e => { if(e.key==='Enter') startGame(); });
-
-/* ── Utils ────────────────────────────────────────────── */
-function safeJSONParse(t){ try{return JSON.parse(t);}catch(e){return null;} }
-
-async function apiPost(action, data) {
-  if (!SERVER_PHP) return null;
-  try {
-    const url = `${SERVER_PHP}?action=${encodeURIComponent(action)}&_=${Date.now()}`;
-    const resp = await fetch(url, {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({action,...data}), cache:'no-store'
-    });
-    const text = await resp.text();
-    if(text.trim().startsWith('{')||text.trim().startsWith('[')) return JSON.parse(text);
-    return null;
-  } catch(e){ return null; }
-}
-
-async function apiGet(action, extra='') {
-  if (!SERVER_PHP) return null;
-  try {
-    const url = `${SERVER_PHP}?action=${encodeURIComponent(action)}${extra}&_=${Date.now()}`;
-    const resp = await fetch(url,{cache:'no-store'});
-    const text = await resp.text();
-    if(text.trim().startsWith('{')||text.trim().startsWith('[')) return JSON.parse(text);
-    return null;
-  } catch(e){ return null; }
-}
 
 /* ── World gen helpers ────────────────────────────────── */
 function seededRandom(x,z,s){
@@ -210,18 +241,16 @@ function init() {
   setupInventory();
   startInitialChunks();
 
-  loadSavedBlocks().then(()=>{
-    setInterval(loadSavedBlocks, 6000);
-  });
+  loadSavedBlocks();
 
-  /* multiplayer loops */
-  setInterval(sendPlayerPosition, 200);
-  setInterval(fetchOtherPlayers,  400);
+  /* send position over WS every 50ms — tiny packet, no overhead */
+  setInterval(() => {
+    if (!player) return;
+    wsSend({ type: 'move', x: player.pos.x, y: player.pos.y, z: player.pos.z, yaw });
+  }, 50);
 
   /* tell server we're leaving */
-  window.addEventListener('beforeunload', ()=>{
-    navigator.sendBeacon(`${SERVER_PHP}?action=leave_player`, JSON.stringify({id:MY_ID}));
-  });
+  window.addEventListener('beforeunload', () => { if(ws) ws.close(); });
 
   tick();
 }
@@ -386,9 +415,12 @@ function removeBlockFromChunkIndex(x,z,blockKey){
 }
 
 async function loadSavedBlocks(){
-  const data=await apiGet('get_blocks');
-  if(!data||!Array.isArray(data.blocks))return;
-  for(const b of data.blocks) addBlock(b.x,b.y,b.z,b.id);
+  try {
+    const resp = await fetch('/api/blocks', {cache:'no-store'});
+    const data = await resp.json();
+    if(data && Array.isArray(data.blocks))
+      for(const b of data.blocks) addBlock(b.x,b.y,b.z,b.id);
+  } catch(e){ console.warn('loadSavedBlocks error', e); }
 }
 
 /* =============================================
@@ -471,89 +503,47 @@ function makeNameLabel(name, color) {
 function upsertRemotePlayer(data) {
   const {id, name, x, y, z, yaw: yw, color} = data;
   if (id === MY_ID) return;
-
   if (remotePlayers.has(id)) {
-    // smooth interpolation
     const rp = remotePlayers.get(id);
-    rp.group.position.set(x, y - 1.0, z);
+    rp.targetX = x; rp.targetY = y - 1.0; rp.targetZ = z;
     rp.group.rotation.y = yw;
-    rp.lastSeen = Date.now();
   } else {
-    // create new player
     const group = makePlayerMesh(color);
     group.position.set(x, y - 1.0, z);
     group.rotation.y = yw;
     const label = makeNameLabel(name, color);
     group.add(label);
     scene.add(group);
-    remotePlayers.set(id, {group, lastSeen: Date.now(), color, name});
+    remotePlayers.set(id, { group, targetX: x, targetY: y-1.0, targetZ: z, color, name });
   }
 }
 
-function removeStaleRemotePlayers(activeIds) {
-  for (const [id, rp] of remotePlayers) {
-    if (!activeIds.has(id)) {
-      scene.remove(rp.group);
-      remotePlayers.delete(id);
-    }
-  }
+function moveRemotePlayer(msg) {
+  const rp = remotePlayers.get(msg.id);
+  if (!rp) return;
+  rp.targetX = msg.x; rp.targetY = msg.y - 1.0; rp.targetZ = msg.z;
+  rp.group.rotation.y = msg.yaw;
 }
 
-/* Animate remote players (bob arms) */
-function animateRemotePlayers(t) {
-  for (const rp of remotePlayers.values()) {
-    const g = rp.group;
-    // bob arms
-    if (g.children[2]) g.children[2].rotation.x = Math.sin(t*3)*0.3;   // lArm
-    if (g.children[3]) g.children[3].rotation.x = -Math.sin(t*3)*0.3;  // rArm
-    if (g.children[4]) g.children[4].rotation.x = -Math.sin(t*3)*0.2;  // lLeg
-    if (g.children[5]) g.children[5].rotation.x = Math.sin(t*3)*0.2;   // rLeg
-  }
+function removeRemotePlayer(id) {
+  const rp = remotePlayers.get(id);
+  if (rp) { scene.remove(rp.group); remotePlayers.delete(id); }
 }
 
-/* Send MY position to server */
-async function sendPlayerPosition() {
-  await apiPost('update_player', {
-    id: MY_ID, name: MY_NAME, color: MY_COLOR,
-    x: player.pos.x, y: player.pos.y, z: player.pos.z,
-    yaw
-  });
-}
-
-/* Fetch other players from server */
-async function fetchOtherPlayers() {
-  const data = await apiGet('get_players', `&myid=${encodeURIComponent(MY_ID)}`);
-  if (!data) { console.warn('fetchOtherPlayers: no response'); return; }
-  if (!Array.isArray(data.players)) { console.warn('fetchOtherPlayers: unexpected response', data); return; }
-
-  const activeIds = new Set();
-  for (const p of data.players) {
-    activeIds.add(p.id);
-    upsertRemotePlayer(p);
-  }
-  removeStaleRemotePlayers(activeIds);
-
-  const count = data.players.length + 1;
-  document.getElementById('online-count').textContent = count;
-  updatePlayerListHUD(data.players);
-}
-
-function updatePlayerListHUD(others) {
+function updatePlayerListHUD() {
   const el = document.getElementById('pl-entries');
   el.innerHTML = '';
-
-  // self
   const selfDiv = document.createElement('div');
   selfDiv.className = 'pl-entry';
   selfDiv.innerHTML = `<div class="pl-dot" style="background:${MY_COLOR}"></div><span>${MY_NAME} (you)</span>`;
   el.appendChild(selfDiv);
-
-  for (const p of others) {
+  for (const [, rp] of remotePlayers) {
     const d = document.createElement('div');
     d.className = 'pl-entry';
-    d.innerHTML = `<div class="pl-dot" style="background:${p.color}"></div><span>${p.name}</span>`;
+    d.innerHTML = `<div class="pl-dot" style="background:${rp.color}"></div><span>${rp.name}</span>`;
     el.appendChild(d);
   }
+  document.getElementById('online-count').textContent = remotePlayers.size + 1;
 }
 
 /* =============================================
@@ -692,14 +682,14 @@ async function addBlockAndMaybeSend(x,y,z,id){
   const ok=addBlock(x,y,z,id);
   if(ok){
     ensureBlockIndexedInChunk(x,z,key(x,y,z));
-    if(SERVER_PHP) apiPost('set_block',{x,y,z,id});
+    wsSend({ type:'set_block', x, y, z, id });
   }
 }
 async function removeBlockAndMaybeSend(x,y,z){
   const ok=removeBlockAt(x,y,z);
   if(ok){
     removeBlockFromChunkIndex(x,z,key(x,y,z));
-    if(SERVER_PHP) apiPost('block_remove',{x,y,z});
+    wsSend({ type:'block_remove', x, y, z });
   }
 }
 
@@ -770,7 +760,19 @@ function tick(){
 
   stepPlayer(dt);
   updateChunks(player.pos.x,player.pos.z);
-  animateRemotePlayers(t);
+
+  // smoothly interpolate remote players toward their target positions
+  for (const rp of remotePlayers.values()) {
+    const g = rp.group;
+    g.position.x += (rp.targetX - g.position.x) * 0.2;
+    g.position.y += (rp.targetY - g.position.y) * 0.2;
+    g.position.z += (rp.targetZ - g.position.z) * 0.2;
+    // animate arms/legs
+    if(g.children[2]) g.children[2].rotation.x =  Math.sin(t*3)*0.3;
+    if(g.children[3]) g.children[3].rotation.x = -Math.sin(t*3)*0.3;
+    if(g.children[4]) g.children[4].rotation.x = -Math.sin(t*3)*0.2;
+    if(g.children[5]) g.children[5].rotation.x =  Math.sin(t*3)*0.2;
+  }
 
   camera.rotation.order='YXZ';
   camera.rotation.y=yaw;

@@ -1,116 +1,114 @@
-const express = require('express');
-const fs = require('fs');
-const path = require('path');
+const express    = require('express');
+const http       = require('http');
+const { WebSocketServer, WebSocket } = require('ws');
+const fs         = require('fs');
+const path       = require('path');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+const app    = express();
+const server = http.createServer(app);
+const wss    = new WebSocketServer({ server });
+const PORT   = process.env.PORT || 3000;
 
-const WORLD_FILE   = path.join(__dirname, 'world.json');
-const PLAYERS_FILE = path.join(__dirname, 'players.json');
+const WORLD_FILE = path.join(__dirname, 'world.json');
 
 app.use(express.json());
-app.use(express.static(__dirname)); // serve index.html + assets
+app.use(express.static(__dirname));
 
-// ── File helpers ────────────────────────────────────────────
-function loadJSON(file, fallback) {
+// ── Persistence ─────────────────────────────────────────────
+function loadWorld() {
   try {
-    if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (fs.existsSync(WORLD_FILE))
+      return JSON.parse(fs.readFileSync(WORLD_FILE, 'utf8')).blocks || [];
   } catch(e) {}
-  return fallback;
+  return [];
 }
-function saveJSON(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
-}
-
-// ── In-memory state (loaded from disk on startup) ───────────
-let blocks  = loadJSON(WORLD_FILE,   { blocks: [] }).blocks  || [];
-let players = loadJSON(PLAYERS_FILE, { players: [] }).players || [];
-
-function saveToDisk() {
-  saveJSON(WORLD_FILE,   { blocks });
-  saveJSON(PLAYERS_FILE, { players });
+function saveWorld() {
+  fs.writeFileSync(WORLD_FILE, JSON.stringify({ blocks: [...blocks.values()] }, null, 2));
 }
 
-// Prune players inactive > 4 seconds
-function prunePlayers() {
-  const now = Date.now();
-  players = players.filter(p => (now - (p.t || 0)) < 4000);
-}
+// blocks stored as Map "x,y,z" -> {x,y,z,id}
+const blocks = new Map();
+for (const b of loadWorld()) blocks.set(`${b.x},${b.y},${b.z}`, b);
 
-// ── Routes ───────────────────────────────────────────────────
-
-// GET /api?action=get_blocks
-// GET /api?action=get_players&myid=xxx
-app.get('/api', (req, res) => {
-  const action = req.query.action;
-
-  if (action === 'get_blocks') {
-    return res.json({ ok: 1, blocks });
-  }
-
-  if (action === 'get_players') {
-    prunePlayers();
-    const myId  = req.query.myid || '';
-    const others = players
-      .filter(p => p.id !== myId)
-      .map(({ id, name, x, y, z, yaw, color }) => ({ id, name, x, y, z, yaw, color }));
-    return res.json({ ok: 1, players: others });
-  }
-
-  res.json({ ok: 0, error: 'unknown action' });
+// ── REST — only for initial block load ──────────────────────
+app.get('/api/blocks', (req, res) => {
+  res.json({ ok: 1, blocks: [...blocks.values()] });
 });
 
-// POST /api?action=...
-app.post('/api', (req, res) => {
-  const action = req.query.action;
-  const body   = req.body || {};
+// ── WebSocket ────────────────────────────────────────────────
+// clients: Map  ws -> { id, name, color, x, y, z, yaw }
+const clients = new Map();
 
-  // ── blocks ──────────────────────────────────────────────
-  if (action === 'set_block') {
-    const { x, y, z, id } = body;
-    if (x == null || y == null || z == null || id == null)
-      return res.json({ ok: 0, error: 'missing params' });
-
-    const existing = blocks.find(b => b.x === x && b.y === y && b.z === z);
-    if (existing) existing.id = id;
-    else blocks.push({ x, y, z, id });
-
-    saveToDisk();
-    return res.json({ ok: 1 });
+function broadcast(data, excludeWs = null) {
+  const msg = JSON.stringify(data);
+  for (const [ws] of clients) {
+    if (ws !== excludeWs && ws.readyState === WebSocket.OPEN)
+      ws.send(msg);
   }
+}
+function sendTo(ws, data) {
+  if (ws.readyState === WebSocket.OPEN)
+    ws.send(JSON.stringify(data));
+}
 
-  if (action === 'block_remove') {
-    const { x, y, z } = body;
-    if (x == null || y == null || z == null)
-      return res.json({ ok: 0, error: 'missing params' });
+wss.on('connection', (ws) => {
 
-    blocks = blocks.filter(b => !(b.x === x && b.y === y && b.z === z));
-    saveToDisk();
-    return res.json({ ok: 1 });
-  }
+  ws.on('message', (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
 
-  // ── players ─────────────────────────────────────────────
-  if (action === 'update_player') {
-    const { id, name, x, y, z, yaw, color } = body;
-    if (!id) return res.json({ ok: 0, error: 'missing id' });
+    switch (msg.type) {
 
-    prunePlayers();
-    const existing = players.find(p => p.id === id);
-    if (existing) {
-      Object.assign(existing, { name, x, y, z, yaw, color, t: Date.now() });
-    } else {
-      players.push({ id, name, x, y, z, yaw, color, t: Date.now() });
+      case 'join': {
+        const { id, name, color, x, y, z, yaw } = msg;
+        clients.set(ws, { id, name, color, x: x||0, y: y||5, z: z||0, yaw: yaw||0 });
+        // send this player the full list of others
+        const others = [...clients.entries()]
+          .filter(([w]) => w !== ws)
+          .map(([, p]) => p);
+        sendTo(ws, { type: 'players_list', players: others });
+        // announce to everyone else
+        broadcast({ type: 'player_join', player: { id, name, color, x, y, z, yaw } }, ws);
+        console.log(`[+] ${name} joined. Online: ${clients.size}`);
+        break;
+      }
+
+      case 'move': {
+        const p = clients.get(ws);
+        if (!p) break;
+        p.x = msg.x; p.y = msg.y; p.z = msg.z; p.yaw = msg.yaw;
+        broadcast({ type: 'player_move', id: p.id, x: p.x, y: p.y, z: p.z, yaw: p.yaw }, ws);
+        break;
+      }
+
+      case 'set_block': {
+        const { x, y, z, id } = msg;
+        blocks.set(`${x},${y},${z}`, { x, y, z, id });
+        saveWorld();
+        broadcast({ type: 'set_block', x, y, z, id }, ws);
+        break;
+      }
+
+      case 'block_remove': {
+        const { x, y, z } = msg;
+        blocks.delete(`${x},${y},${z}`);
+        saveWorld();
+        broadcast({ type: 'block_remove', x, y, z }, ws);
+        break;
+      }
     }
-    return res.json({ ok: 1 });
-  }
+  });
 
-  if (action === 'leave_player') {
-    const { id } = body;
-    if (id) players = players.filter(p => p.id !== id);
-    return res.json({ ok: 1 });
-  }
+  ws.on('close', () => {
+    const p = clients.get(ws);
+    if (p) {
+      console.log(`[-] ${p.name} left. Online: ${clients.size - 1}`);
+      broadcast({ type: 'player_leave', id: p.id });
+      clients.delete(ws);
+    }
+  });
 
-  res.json({ ok: 0, error: 'unknown action' });
+  ws.on('error', () => ws.terminate());
 });
 
-app.listen(PORT, () => console.log(`MiniCraft server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`MiniCraft WS server on port ${PORT}`));
