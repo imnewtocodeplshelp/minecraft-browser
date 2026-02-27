@@ -4,7 +4,7 @@
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
 <title>MiniCraft — Multiplayer</title>
-<script src="https://unpkg.com/three@0.150.0/build/three.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <style>
   html,body{height:100%;margin:0;overflow:hidden;-webkit-touch-callout:none;-webkit-user-select:none;touch-action:none}
   #game-container{width:100vw;height:100vh;position:relative;background:#87CEEB}
@@ -203,6 +203,9 @@ function init() {
   player = { pos: new THREE.Vector3(0,5,0) };
 
   setupBlocks();
+
+  /* initial small floor so you land on something */
+  for(let x=-8;x<=8;x++) for(let z=-8;z<=8;z++) addBlock(x,0,z,1);
   setupControls();
   setupInventory();
   startInitialChunks();
@@ -230,6 +233,7 @@ const BLOCK={}, BLOCKS=[];
 const BOX_GEO = new THREE.BoxGeometry(1,1,1);
 const MATERIAL = {};
 const world = new Map();
+const loadedChunks = new Map();  // must be declared before generateChunk
 let totalBlocks = 0;
 
 function makeTex(fill,noise=false,stroke=false){
@@ -308,13 +312,12 @@ function updateHUD(){
   document.getElementById('bcount').textContent=totalBlocks;
 }
 
-/* initial small floor */
-for(let x=-8;x<=8;x++) for(let z=-8;z<=8;z++) addBlock(x,0,z,1);
+/* initial floor is generated inside init() after scene is ready */
 
 /* =============================================
    CHUNK SYSTEM
 ============================================= */
-const loadedChunks=new Map();
+/* chunk system */
 
 function generateChunk(cx,cz){
   const ck=`${cx},${cz}`;if(loadedChunks.has(ck))return;
